@@ -17,7 +17,7 @@ import torch.utils.data as Data
 from sklearn.metrics import roc_auc_score, log_loss
 
 from utils import load_parse_from_json, setup_seed, load_data, weight_init, str2list
-from models import DLCM, PRM, SetRank, MIR, LightGCN, XGBoostReranker
+from models import DLCM, PRM, SetRank, MIR, LightGCN, EnhancedLightGCN, LLM4Rerank, LightGCNPlusPlus
 from utils import evaluate_rerank
 from dataset import AmzDataset
 from optimization import AdamW, get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
@@ -66,8 +66,12 @@ def load_model(args, dataset):
         model = MIR(args, dataset).to(device)
     elif algo == 'LightGCN':
         model = LightGCN(args, dataset).to(device)
-    elif algo == 'XGBoostReranker':
-        model = XGBoostReranker(args, dataset).to(device)
+    elif algo == 'EnhancedLightGCN':
+        model = EnhancedLightGCN(args, dataset).to(device)
+    elif algo == 'LLM4Rerank':
+        model = LLM4Rerank(args, dataset).to(device)
+    elif algo == 'LightGCNPlusPlus':
+        model = LightGCNPlusPlus(args, dataset).to(device)
     else:
         print('No Such Model')
         exit()
@@ -214,6 +218,16 @@ def parse_args():
     parser.add_argument('--max_depth', default=6, type=int, help='max depth of XGBoost trees')
     parser.add_argument('--n_estimators', default=100, type=int, help='number of trees in XGBoost')
     parser.add_argument('--feature_mlp_arch', default='256,128,64', type=str2list, help='architecture of feature extractor MLP')
+    
+    # LLM4Rerank 파라미터
+    parser.add_argument('--llm_heads', default=4, type=int, help='number of attention heads in LLM4Rerank')
+    parser.add_argument('--llm_layers', default=2, type=int, help='number of transformer layers in LLM4Rerank')
+    parser.add_argument('--llm_ff_dim', default=256, type=int, help='feedforward dimension in LLM4Rerank')
+    
+    # LightGCN++ 추가 파라미터
+    parser.add_argument('--norm_scale', default=1.0, type=float, help='initial value for norm scaling in LightGCN++')
+    parser.add_argument('--layer_weight_init', default=1.0, type=float, help='initial value for layer weights in LightGCN++')
+    parser.add_argument('--neighbor_weight_init', default=1.0, type=float, help='initial value for neighbor weights in LightGCN++')
 
     args, _ = parser.parse_known_args()
     args.augment = True if args.augment.lower() == 'true' else False
@@ -232,4 +246,3 @@ if __name__ == '__main__':
 
     print('parameters', args)
     train(args)
-

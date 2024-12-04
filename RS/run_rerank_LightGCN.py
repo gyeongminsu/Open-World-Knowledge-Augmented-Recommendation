@@ -27,7 +27,7 @@ export_num = 2
 specific_export_num = 5
 temperature = 0.5
 
-n_layers = 3
+n_layers = 4
 
 # Run the train process
 

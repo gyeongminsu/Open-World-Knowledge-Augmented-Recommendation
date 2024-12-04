@@ -159,7 +159,7 @@ class BaseModel(nn.Module):
 
     def get_rerank_output(self, logits, labels=None, attn=False):
         outputs = {
-            'logits': logits,
+            'logits': torch.sigmoid(logits),  # Ensure logits are constrained to [0, 1]
             'labels': labels,
         }
 
@@ -608,93 +608,276 @@ class LightGCN(BaseModel):
         
         outputs = self.get_rerank_output(scores, labels)
         return outputs
-    
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
 
-class XGBoostReranker(BaseModel):
+class EnhancedLightGCN(BaseModel):
     def __init__(self, args, dataset):
-        super(XGBoostReranker, self).__init__(args, dataset)
+        super(EnhancedLightGCN, self).__init__(args, dataset)
+        self.n_layers = 3  # Optimal number of layers
+        self.keep_prob = 1 - args.dropout
+        self.alpha = 0.5  # Layer weight parameter
+        self.hard_neg_margin = 0.3
+        self.curriculum_temp = 1.0  # For curriculum learning
         
-        # lr을 learning_rate로 사용
-        self.xgb_params = {
-            'objective': 'rank:pairwise',
-            'learning_rate': float(args.lr) if hasattr(args, 'lr') else 0.1,
-            'max_depth': args.max_depth if hasattr(args, 'max_depth') else 6,
-            'n_estimators': args.n_estimators if hasattr(args, 'n_estimators') else 100,
-            'subsample': 0.8,
-            'colsample_bytree': 0.8,
-            'tree_method': 'gpu_hist',  # GPU 사용
-            'device': 'cuda'
-        }
+        # Initialize embeddings with Xavier initialization
+        self.embedding_dict = nn.ParameterDict({
+            "user_emb": nn.Parameter(torch.randn(self.max_hist_len, self.embed_dim)),
+            "item_emb": nn.Parameter(torch.randn(self.max_list_len, self.embed_dim))
+        })
         
-        self.scaler = StandardScaler()
-        self.model = None
-        self.training = True
-        self.is_fitted = False
+        nn.init.xavier_uniform_(self.embedding_dict["user_emb"])
+        nn.init.xavier_uniform_(self.embedding_dict["item_emb"])
+        
+        # Layer-specific transformation
+        self.layer_transforms = nn.ModuleList([
+            nn.Linear(self.embed_dim, self.embed_dim) for _ in range(self.n_layers)
+        ])
+        
+        # Get normalized adj matrix with self-connections
+        self.register_buffer("norm_adj_matrix", self.get_norm_adj_matrix())
+        
+    def get_norm_adj_matrix(self):
+        adj_mat = torch.zeros((self.max_hist_len + self.max_list_len,
+                             self.max_hist_len + self.max_list_len))
+        
+        # Enhanced adjacency matrix with self-connections
+        adj_mat[:self.max_hist_len, self.max_hist_len:] = 1
+        adj_mat[self.max_hist_len:, :self.max_hist_len] = 1
+        adj_mat = adj_mat + torch.eye(self.max_hist_len + self.max_list_len)
+        
+        # Symmetric normalization
+        degree = torch.sum(adj_mat, dim=1)
+        degree_inv_sqrt = torch.pow(degree, -0.5)
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0
+        degree_inv_sqrt = torch.diag(degree_inv_sqrt)
+        norm_adj = torch.mm(torch.mm(degree_inv_sqrt, adj_mat), degree_inv_sqrt)
+        
+        return norm_adj
+    
+    def mix_propagate(self, all_embeddings, current_layer):
+        # MixGCF propagation
+        neighbors_embeddings = torch.sparse.mm(self.norm_adj_matrix, all_embeddings)
+        transformed_embeddings = self.layer_transforms[current_layer](neighbors_embeddings)
+        mixed_embeddings = self.alpha * transformed_embeddings + (1 - self.alpha) * all_embeddings
+        return F.normalize(mixed_embeddings, p=2, dim=1)
+    
+    def get_hard_negatives(self, user_embeddings, item_embeddings):
+        # Calculate similarity scores
+        similarity = torch.matmul(user_embeddings, item_embeddings.transpose(1, 2))
+        
+        # Find hard negatives (items with high similarity but are not positive)
+        hard_negative_scores, hard_negative_indices = torch.topk(similarity, k=5, dim=2)
+        return hard_negative_indices
+    
+    def forward(self, inp):
+        item_embedding, user_behavior, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
+        batch_size = item_embedding.size(0)
+        
+        # Initial embeddings
+        all_embeddings = torch.cat([self.embedding_dict["user_emb"], 
+                                  self.embedding_dict["item_emb"]], dim=0)
+        all_embeddings = F.normalize(all_embeddings, p=2, dim=1)
+        
+        # Multi-layer propagation with MixGCF
+        embeddings_list = [all_embeddings]
+        for layer in range(self.n_layers):
+            all_embeddings = self.mix_propagate(all_embeddings, layer)
+            embeddings_list.append(all_embeddings)
+        
+        # Weighted sum of layer embeddings
+        weights = torch.softmax(torch.tensor([1.0] * (self.n_layers + 1)), dim=0)
+        all_embeddings = sum([emb * w for emb, w in zip(embeddings_list, weights)])
+        
+        user_all_embeddings, item_all_embeddings = torch.split(
+            all_embeddings, [self.max_hist_len, self.max_list_len], dim=0
+        )
+        
+        # Reshape for batch processing
+        user_embeddings = user_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+        item_embeddings = item_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # Get hard negatives
+        hard_neg_indices = self.get_hard_negatives(user_embeddings, item_embeddings)
+        
+        # Calculate attention scores with temperature scaling
+        attention_logits = torch.bmm(user_embeddings, item_embeddings.transpose(1, 2))
+        attention_weights = F.softmax(attention_logits / self.curriculum_temp, dim=1)
+        
+        # Combine attention scores with hard negative information
+        hard_negative_mask = torch.zeros_like(attention_weights).scatter_(
+            2, hard_neg_indices, self.hard_neg_margin
+        )
+        attention_weights = attention_weights - hard_negative_mask
+        
+        # Final scoring
+        scores = torch.sum(attention_weights, dim=1)
+        scores = torch.sigmoid(scores)
+        
+        # Update curriculum temperature
+        self.curriculum_temp = max(0.5, self.curriculum_temp * 0.995)  # Gradually decrease temperature
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class LLM4Rerank(BaseModel):
+    def __init__(self, args, dataset):
+        super(LLM4Rerank, self).__init__(args, dataset)
+        
+        # LLM-specific parameters
+        self.llm_heads = args.llm_heads 
+        self.llm_layers = args.llm_layers
+        self.llm_ff_dim = args.llm_ff_dim
+        
+        # Input dimension
+        self.inp_dim = self.itm_emb_dim
+        if self.augment_num:
+            self.inp_dim += self.dens_vec_num  # Ensure this matches the actual embedding dimension
+        
+        # Debug print
+        #print(f"self.inp_dim: {self.inp_dim}")
+        #print(f"self.itm_emb_dim: {self.itm_emb_dim}")
+        #print(f"self.dens_vec_num: {self.dens_vec_num}")
+        
+        # Attention layer
+        self.attention = nn.MultiheadAttention(
+            embed_dim=self.inp_dim,
+            num_heads=self.llm_heads,
+            batch_first=True,
+            dropout=args.dropout
+        )
+        
+        # Positional embedding layer
+        self.max_seq_len = self.max_list_len
+        self.pos_embedding_layer = nn.Embedding(self.max_seq_len, self.inp_dim)
+        
+        # MLP layers
+        self.mlp = MLP(
+            args.final_mlp_arch,
+            self.inp_dim * 2,
+            args.dropout
+        )
+        
+        self.score_proj = nn.Linear(args.final_mlp_arch[-1], 1)
+        
+    def forward(self, inp):
+        # Process input
+        item_embedding, _, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
+        
+        # Concatenate dens_vec if present
+        if dens_vec is not None:
+            item_embedding = torch.cat([item_embedding, dens_vec], dim=-1)
+        
+        # Debug print
+        #print(f"item_embedding shape: {item_embedding.shape}")
+        
+        # Sequence length
+        seq_len = item_embedding.size(1)
+        
+        # Position IDs
+        position_ids = torch.arange(seq_len, device=item_embedding.device).unsqueeze(0).expand(item_embedding.size(0), seq_len)
+        
+        # Positional embeddings
+        pos_embed = self.pos_embedding_layer(position_ids)
+        
+        # Debug print
+        #print(f"pos_embed shape: {pos_embed.shape}")
+        
+        # Add positional embeddings
+        item_embed_pos = item_embedding + pos_embed
+        
+        # Self attention
+        attn_out, _ = self.attention(
+            item_embed_pos,
+            item_embed_pos,
+            item_embed_pos
+        )
+        
+        # Concatenate attention output with original embeddings
+        mlp_input = torch.cat([attn_out, item_embed_pos], dim=-1)
+        
+        # MLP scoring
+        mlp_out = self.mlp(mlp_input)
+        scores = torch.sigmoid(self.score_proj(mlp_out).squeeze(-1))
+        
+        # Get final scores
+        outputs = self.get_rerank_output(scores, labels, attn=True)
+        
+        return outputs
+       
+class LightGCNPlusPlus(BaseModel):
+    def __init__(self, args, dataset):
+        super(LightGCNPlusPlus, self).__init__(args, dataset)
+        self.n_layers = args.n_layers
+        self.keep_prob = 1 - args.dropout
+        
+        # Initialize embeddings
+        self.embedding_dict = nn.ParameterDict({
+            'user_emb': nn.Parameter(torch.randn(self.max_hist_len, self.embed_dim)),
+            'item_emb': nn.Parameter(torch.randn(self.max_list_len, self.embed_dim))
+        })
+        
+        # New parameters for LightGCN++
+        self.layer_weights = nn.Parameter(torch.ones(self.n_layers + 1))
+        self.norm_scale = nn.Parameter(torch.ones(1))
+        self.neighbor_weights = nn.Parameter(torch.ones(self.n_layers))
+        
+        self.register_buffer('norm_adj_matrix', self.get_norm_adj_matrix())
+
+    def get_norm_adj_matrix(self):
+        adj_mat = torch.zeros((self.max_hist_len + self.max_list_len, 
+                             self.max_hist_len + self.max_list_len))
+        
+        adj_mat[:self.max_hist_len, self.max_hist_len:] = 1
+        adj_mat[self.max_hist_len:, :self.max_hist_len] = 1
+        
+        adj_mat = adj_mat + torch.eye(self.max_hist_len + self.max_list_len)
+
+        degree = torch.sum(adj_mat, dim=1)
+        degree_inv_sqrt = torch.pow(degree, -0.5)
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0
+        
+        degree_inv_sqrt = torch.diag(degree_inv_sqrt)
+        norm_adj = torch.mm(torch.mm(degree_inv_sqrt, adj_mat), degree_inv_sqrt)
+        
+        return norm_adj
 
     def forward(self, inp):
         item_embedding, user_behavior, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
-        
-        # 배치 크기와 리스트 길이 가져오기
-        batch_size = item_embedding.size(0)
-        
-        # 사용자 행동 정보를 평균화
-        user_repr = torch.mean(user_behavior, dim=1)
-        user_repr = user_repr.unsqueeze(1).repeat(1, self.max_list_len, 1)
-        
-        # 특성 결합
-        if dens_vec is not None:
-            features = torch.cat([item_embedding, user_repr, dens_vec], dim=-1)
-        else:
-            features = torch.cat([item_embedding, user_repr], dim=-1)
-            
-        # numpy 배열로 변환
-        features = features.detach().cpu().numpy().reshape(batch_size * self.max_list_len, -1)
-        
-        if self.training and labels is not None:
-            # 학습 모드
-            labels_np = labels.detach().cpu().numpy().flatten()
-            
-            # 그룹 정보 생성
-            groups = np.full(batch_size, self.max_list_len)
-            
-            # 특성 스케일링
-            features = self.scaler.fit_transform(features)
-            
-            # XGBoost 데이터셋 생성
-            dtrain = xgb.DMatrix(features, label=labels_np)
-            dtrain.set_group(groups)
-            
-            # 모델 학습
-            self.model = xgb.train(
-                self.xgb_params,
-                dtrain,
-                num_boost_round=self.xgb_params['n_estimators']
-            )
-            self.is_fitted = True
-            
-            # 예측
-            predictions = self.model.predict(dtrain)
-            scores = torch.FloatTensor(predictions).view(batch_size, self.max_list_len)
-            scores = torch.sigmoid(scores).to(labels.device)
-        else:
-            # 평가 모드
-            if self.model is not None:
-                features = self.scaler.transform(features)
-                dtest = xgb.DMatrix(features)
-                predictions = self.model.predict(dtest)
-                scores = torch.FloatTensor(predictions).view(batch_size, self.max_list_len)
-                scores = torch.sigmoid(scores).to(labels.device)
-            else:
-                scores = torch.zeros(batch_size, self.max_list_len).to(labels.device)
 
-        outputs = {
-            'logits': scores,
-            'labels': labels
-        }
+        batch_size = item_embedding.size(0)
+
+        # Enhanced Light Graph Convolution
+        all_embeddings = torch.cat([self.embedding_dict['user_emb'], 
+                                  self.embedding_dict['item_emb']], dim=0)
+        embeddings_list = [all_embeddings]
         
-        if labels is not None:
-            # XGBoost는 자체적으로 loss를 계산하므로 0으로 설정
-            outputs['loss'] = torch.tensor(0.0, requires_grad=True).to(labels.device)
+        # Flexible norm scaling and neighbor weighting
+        current_embedding = all_embeddings * self.norm_scale
+        
+        for layer in range(self.n_layers):
+            neighbor_embedding = torch.sparse.mm(self.norm_adj_matrix, current_embedding)
+            current_embedding = neighbor_embedding * self.neighbor_weights[layer]
+            embeddings_list.append(current_embedding)
             
+        # Improved layer combination with learnable weights
+        all_embeddings = torch.stack(embeddings_list, dim=1)
+        weights = F.softmax(self.layer_weights, dim=0)
+        all_embeddings = torch.sum(all_embeddings * weights.view(1, -1, 1), dim=1)
+        
+        user_all_embeddings, item_all_embeddings = torch.split(all_embeddings, 
+            [self.max_hist_len, self.max_list_len], dim=0)
+        
+        user_embeddings = user_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+        item_embeddings = item_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+
+        # Calculate scores with enhanced embeddings
+        scores = torch.bmm(user_embeddings, item_embeddings.transpose(1, 2))
+        scores = torch.mean(scores, dim=1)
+        scores = torch.sigmoid(scores)
+        
+        outputs = self.get_rerank_output(scores, labels)
         return outputs
