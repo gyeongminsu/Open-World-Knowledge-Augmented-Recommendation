@@ -808,6 +808,182 @@ class LLM4Rerank(BaseModel):
         
         return outputs
        
+class EnhancedLLM4Rerank(BaseModel):
+    def __init__(self, args, dataset):
+        super(EnhancedLLM4Rerank, self).__init__(args, dataset)
+        
+        # LLM-specific parameters
+        self.llm_heads = args.llm_heads 
+        self.llm_layers = args.llm_layers
+        self.llm_ff_dim = args.llm_ff_dim
+        
+        # Input dimension
+        self.inp_dim = self.itm_emb_dim
+        if self.augment_num:
+            self.inp_dim += self.dens_vec_num
+        
+        # Layer Normalization
+        self.layer_norm1 = nn.LayerNorm(self.inp_dim)
+        self.layer_norm2 = nn.LayerNorm(self.inp_dim)
+        
+        # Multi-layer transformer blocks
+        self.transformer_layers = nn.ModuleList([
+            nn.ModuleDict({
+                'attention': nn.MultiheadAttention(
+                    embed_dim=self.inp_dim,
+                    num_heads=self.llm_heads,
+                    batch_first=True,
+                    dropout=args.dropout
+                ),
+                'ff_layer': nn.Sequential(
+                    nn.Linear(self.inp_dim, self.llm_ff_dim),
+                    nn.GELU(),
+                    nn.Dropout(args.dropout),
+                    nn.Linear(self.llm_ff_dim, self.inp_dim),
+                    nn.Dropout(args.dropout)
+                )
+            }) for _ in range(self.llm_layers)
+        ])
+        
+        # Positional embedding
+        self.max_seq_len = self.max_list_len
+        self.pos_embedding_layer = nn.Embedding(self.max_seq_len, self.inp_dim)
+        
+        # Cross-attention layer for global context
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=self.inp_dim,
+            num_heads=self.llm_heads,
+            batch_first=True,
+            dropout=args.dropout
+        )
+        
+        # Final MLP with residual connections
+        self.mlp = nn.Sequential(
+            nn.Linear(self.inp_dim * 2, args.final_mlp_arch[0]),
+            nn.LayerNorm(args.final_mlp_arch[0]),
+            nn.GELU(),
+            nn.Dropout(args.dropout),
+            nn.Linear(args.final_mlp_arch[0], args.final_mlp_arch[1]),
+            nn.LayerNorm(args.final_mlp_arch[1]),
+            nn.GELU(),
+            nn.Dropout(args.dropout)
+        )
+        
+        self.score_proj = nn.Linear(args.final_mlp_arch[-1], 1)
+        
+    def forward(self, inp):
+        item_embedding, _, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
+        
+        if dens_vec is not None:
+            item_embedding = torch.cat([item_embedding, dens_vec], dim=-1)
+        
+        # Add positional embeddings
+        seq_len = item_embedding.size(1)
+        position_ids = torch.arange(seq_len, device=item_embedding.device).unsqueeze(0).expand(item_embedding.size(0), seq_len)
+        pos_embed = self.pos_embedding_layer(position_ids)
+        x = item_embedding + pos_embed
+        
+        # Apply transformer layers with residual connections
+        for layer in self.transformer_layers:
+            # Self-attention block
+            residual = x
+            x = self.layer_norm1(x)
+            attn_out, _ = layer['attention'](x, x, x)
+            x = residual + attn_out
+            
+            # Feed-forward block
+            residual = x
+            x = self.layer_norm2(x)
+            x = residual + layer['ff_layer'](x)
+        
+        # Global context with cross-attention
+        global_context, _ = self.cross_attention(
+            x,
+            x.mean(dim=1, keepdim=True).expand(-1, seq_len, -1),
+            x
+        )
+        
+        # Combine local and global features
+        combined_features = torch.cat([x, global_context], dim=-1)
+        
+        # Final MLP and scoring
+        mlp_out = self.mlp(combined_features)
+        scores = torch.sigmoid(self.score_proj(mlp_out).squeeze(-1))
+        
+        outputs = self.get_rerank_output(scores, labels, attn=True)
+        return outputs
+       
+class LLM4Rerank_1(BaseModel):
+    def __init__(self, args, dataset):
+        super(LLM4Rerank_1, self).__init__(args, dataset)
+        
+        self.llm_heads = args.llm_heads 
+        self.llm_layers = args.llm_layers
+        self.llm_ff_dim = args.llm_ff_dim
+        
+        # Input dimension
+        self.inp_dim = self.itm_emb_dim
+        if self.augment_num:
+            self.inp_dim += self.dens_vec_num
+            
+        # Layer normalization
+        self.input_norm = nn.LayerNorm(self.inp_dim)
+        
+        # Transformer encoder layer
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.inp_dim,
+            nhead=4,
+            dim_feedforward=self.inp_dim * 2,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        # Transformer encoder
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers=2
+        )
+        
+        # Positional embedding
+        self.max_seq_len = self.max_list_len
+        self.pos_embedding = nn.Parameter(torch.zeros(1, self.max_seq_len, self.inp_dim))
+        
+        # Output layers
+        self.output_layer = nn.Sequential(
+            nn.Linear(self.inp_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1)
+        )
+        
+        # Initialize positional embeddings
+        nn.init.xavier_uniform_(self.pos_embedding)
+        
+    def forward(self, inp):
+        item_embedding, _, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
+        
+        if dens_vec is not None:
+            item_embedding = torch.cat([item_embedding, dens_vec], dim=-1)
+        
+        # Add positional embeddings
+        x = item_embedding + self.pos_embedding[:, :item_embedding.size(1), :]
+        
+        # Layer normalization
+        x = self.input_norm(x)
+        
+        # Transformer encoding
+        x = self.transformer_encoder(x)
+        
+        # Output scores
+        scores = torch.sigmoid(self.output_layer(x).squeeze(-1))
+        
+        # Numerical stability
+        scores = torch.clamp(scores, min=1e-7, max=1-1e-7)
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
 class LightGCNPlusPlus(BaseModel):
     def __init__(self, args, dataset):
         super(LightGCNPlusPlus, self).__init__(args, dataset)
@@ -876,6 +1052,310 @@ class LightGCNPlusPlus(BaseModel):
 
         # Calculate scores with enhanced embeddings
         scores = torch.bmm(user_embeddings, item_embeddings.transpose(1, 2))
+        scores = torch.mean(scores, dim=1)
+        scores = torch.sigmoid(scores)
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class NGCF(BaseModel):
+    def __init__(self, args, dataset):
+        super(NGCF, self).__init__(args, dataset)
+        self.n_layers = args.n_layers
+        
+        # Initialize embeddings
+        self.embedding_dict = nn.ParameterDict({
+            'user_emb': nn.Parameter(torch.randn(self.max_hist_len, self.embed_dim)),
+            'item_emb': nn.Parameter(torch.randn(self.max_list_len, self.embed_dim))
+        })
+        
+        # NGCF layers
+        self.layers = nn.ModuleList()
+        self.dropout = args.dropout
+        
+        self.weight_size_list = [self.embed_dim] + [self.embed_dim] * self.n_layers
+        
+        for k in range(self.n_layers):
+            self.layers.append(nn.ModuleDict({
+                'W1': nn.Linear(self.weight_size_list[k], self.weight_size_list[k+1], bias=True),
+                'W2': nn.Linear(self.weight_size_list[k], self.weight_size_list[k+1], bias=True)
+            }))
+        
+        # Get normalized adjacency matrix
+        self.register_buffer('norm_adj_matrix', self.get_norm_adj_matrix())
+        
+    def get_norm_adj_matrix(self):
+        adj_mat = torch.zeros((self.max_hist_len + self.max_list_len, 
+                             self.max_hist_len + self.max_list_len))
+        
+        # Fill adjacency matrix based on user-item interactions
+        adj_mat[:self.max_hist_len, self.max_hist_len:] = 1
+        adj_mat[self.max_hist_len:, :self.max_hist_len] = 1
+        adj_mat = adj_mat + torch.eye(self.max_hist_len + self.max_list_len)
+        
+        # Normalize adjacency matrix
+        degree = torch.sum(adj_mat, dim=1)
+        degree_inv_sqrt = torch.pow(degree, -0.5)
+        degree_inv_sqrt[torch.isinf(degree_inv_sqrt)] = 0
+        degree_inv_sqrt = torch.diag(degree_inv_sqrt)
+        norm_adj = torch.mm(torch.mm(degree_inv_sqrt, adj_mat), degree_inv_sqrt)
+        
+        return norm_adj
+        
+    def forward(self, inp):
+        item_embedding, user_behavior, hist_len, dens_vec, orig_dens_list, labels = self.process_input(inp)
+        batch_size = item_embedding.size(0)
+        
+        # Initial embeddings
+        all_embeddings = torch.cat([self.embedding_dict['user_emb'], 
+                                  self.embedding_dict['item_emb']], dim=0)
+        embeddings_list = [all_embeddings]
+        
+        # Graph Convolution layers
+        for layer in self.layers:
+            # Message construction
+            side_embeddings = torch.sparse.mm(self.norm_adj_matrix, all_embeddings)
+            
+            # Message passing
+            sum_embeddings = F.leaky_relu(layer['W1'](side_embeddings))
+            bi_embeddings = F.leaky_relu(layer['W2'](torch.mul(all_embeddings, side_embeddings)))
+            
+            # Aggregation
+            all_embeddings = sum_embeddings + bi_embeddings
+            
+            # Dropout
+            if self.training:
+                all_embeddings = F.dropout(all_embeddings, self.dropout)
+            
+            # L2 normalize
+            all_embeddings = F.normalize(all_embeddings, p=2, dim=1)
+            embeddings_list.append(all_embeddings)
+            
+        # Layer combination
+        all_embeddings = torch.stack(embeddings_list, dim=1)
+        all_embeddings = torch.mean(all_embeddings, dim=1)
+        
+        # Split user and item embeddings
+        user_all_embeddings, item_all_embeddings = torch.split(all_embeddings, 
+            [self.max_hist_len, self.max_list_len], dim=0)
+        
+        # Reshape for batch processing
+        user_embeddings = user_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+        item_embeddings = item_all_embeddings.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # Calculate scores
+        scores = torch.bmm(user_embeddings, item_embeddings.transpose(1, 2))
+        scores = torch.mean(scores, dim=1)
+        scores = torch.sigmoid(scores)
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class BasicDLCM(BaseModel):
+    def __init__(self, args, dataset):
+        super(BasicDLCM, self).__init__(args, dataset)
+        # Basic feature dimension without augmented vectors
+        self.basic_inp_dim = self.itm_emb_dim
+        
+        self.gru = torch.nn.GRU(self.basic_inp_dim, self.hidden_size, dropout=self.rnn_dp, batch_first=True)
+        self.phi_function = Phi_function(self.hidden_size, self.hidden_size, self.dropout)
+        
+    def forward(self, inp):
+        # Get only item embeddings without augmented vectors
+        item_embedding, user_behavior, hist_len, _, _, labels = self.process_input(inp)
+        seq_state, final_state = self.gru(item_embedding)
+        final_state = torch.squeeze(final_state, dim=0)
+        
+        scores = self.phi_function(seq_state, final_state)
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class BasicLLM4Rerank(BaseModel):
+    def __init__(self, args, dataset):
+        super(BasicLLM4Rerank, self).__init__(args, dataset)
+        self.basic_inp_dim = self.itm_emb_dim
+            
+        self.input_norm = nn.LayerNorm(self.basic_inp_dim)
+        self.encoder_layer = nn.TransformerEncoderLayer(
+            d_model=self.basic_inp_dim,
+            nhead=4,
+            dim_feedforward=self.basic_inp_dim * 2,
+            dropout=0.1,
+            batch_first=True
+        )
+        
+        self.transformer_encoder = nn.TransformerEncoder(
+            self.encoder_layer,
+            num_layers=2
+        )
+        
+        self.pos_embedding = nn.Parameter(torch.zeros(1, self.max_list_len, self.basic_inp_dim))
+        
+        self.output_layer = nn.Sequential(
+            nn.Linear(self.basic_inp_dim, 128),
+            nn.LayerNorm(128),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(128, 1)
+        )
+        
+        nn.init.xavier_uniform_(self.pos_embedding)
+        
+    def forward(self, inp):
+        item_embedding, _, hist_len, _, _, labels = self.process_input(inp)
+        
+        # Add positional embeddings
+        x = item_embedding + self.pos_embedding[:, :item_embedding.size(1), :]
+        x = self.input_norm(x)
+        x = self.transformer_encoder(x)
+        scores = torch.sigmoid(self.output_layer(x).squeeze(-1))
+        scores = torch.clamp(scores, min=1e-7, max=1-1e-7)
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class BasicLightGCN(BaseModel):
+    def __init__(self, args, dataset):
+        super(BasicLightGCN, self).__init__(args, dataset)
+        self.n_layers = args.n_layers
+        
+        # Only basic embeddings without augmented vectors
+        self.embedding_dict = nn.ParameterDict({
+            'user_emb': nn.Parameter(torch.randn(self.max_hist_len, self.embed_dim)),
+            'item_emb': nn.Parameter(torch.randn(self.max_list_len, self.embed_dim))
+        })
+        
+        self.register_buffer('norm_adj_matrix', self.get_norm_adj_matrix())
+        
+    def get_norm_adj_matrix(self):
+        n_users = self.max_hist_len
+        n_items = self.max_list_len
+    
+        # 사용자-아이템 인접 행렬 생성
+        adj_mat = torch.zeros((n_users + n_items, n_users + n_items))
+        adj_mat[:n_users, n_users:] = 1  # 사용자-아이템 연결
+        adj_mat[n_users:, :n_users] = 1  # 아이템-사용자 연결 (전치)
+    
+        # 정규화된 라플라시안 행렬 계산
+        rowsum = adj_mat.sum(1)
+        d_inv_sqrt = torch.pow(rowsum, -0.5)
+        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0
+        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    
+        norm_adj = torch.mm(torch.mm(d_mat_inv_sqrt, adj_mat), d_mat_inv_sqrt)
+    
+        # 희소 텐서로 변환
+        indices = torch.nonzero(norm_adj).t()
+        values = norm_adj[indices[0], indices[1]]
+    
+        return torch.sparse_coo_tensor(
+            indices, values, 
+            size=(n_users + n_items, n_users + n_items)
+        )
+    
+    def forward(self, inp):
+        item_embedding, user_behavior, hist_len, _, _, labels = self.process_input(inp)
+        batch_size = item_embedding.size(0)
+        
+        # Basic GCN propagation
+        all_embeddings = torch.cat([self.embedding_dict['user_emb'], 
+                                  self.embedding_dict['item_emb']], dim=0)
+        embeddings_list = [all_embeddings]
+        
+        for layer in range(self.n_layers):
+            all_embeddings = torch.sparse.mm(self.norm_adj_matrix, all_embeddings)
+            embeddings_list.append(all_embeddings)
+            
+        all_embeddings = torch.mean(torch.stack(embeddings_list), dim=0)
+        user_emb, item_emb = torch.split(all_embeddings, [self.max_hist_len, self.max_list_len])
+        
+        user_emb = user_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+        item_emb = item_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        scores = torch.bmm(user_emb, item_emb.transpose(1, 2))
+        scores = torch.mean(scores, dim=1)
+        scores = torch.sigmoid(scores)
+        
+        outputs = self.get_rerank_output(scores, labels)
+        return outputs
+
+class BasicNGCF(BaseModel):
+    def __init__(self, args, dataset):
+        super(BasicNGCF, self).__init__(args, dataset)
+        self.n_layers = args.n_layers
+        
+        # Basic embeddings
+        self.embedding_dict = nn.ParameterDict({
+            'user_emb': nn.Parameter(torch.randn(self.max_hist_len, self.embed_dim)),
+            'item_emb': nn.Parameter(torch.randn(self.max_list_len, self.embed_dim))
+        })
+        
+        # NGCF layers without augmented features
+        self.layers = nn.ModuleList()
+        self.weight_size_list = [self.embed_dim] * (self.n_layers + 1)
+        
+        for k in range(self.n_layers):
+            self.layers.append(nn.ModuleDict({
+                'W1': nn.Linear(self.weight_size_list[k], self.weight_size_list[k+1], bias=True),
+                'W2': nn.Linear(self.weight_size_list[k], self.weight_size_list[k+1], bias=True)
+            }))
+        
+        self.register_buffer('norm_adj_matrix', self.get_norm_adj_matrix())
+    
+    def get_norm_adj_matrix(self):
+        n_users = self.max_hist_len
+        n_items = self.max_list_len
+    
+        # 사용자-아이템 인접 행렬 생성
+        adj_mat = torch.zeros((n_users + n_items, n_users + n_items))
+        adj_mat[:n_users, n_users:] = 1  # 사용자-아이템 연결
+        adj_mat[n_users:, :n_users] = 1  # 아이템-사용자 연결 (전치)
+    
+        # 정규화된 라플라시안 행렬 계산
+        rowsum = adj_mat.sum(1)
+        d_inv_sqrt = torch.pow(rowsum, -0.5)
+        d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0
+        d_mat_inv_sqrt = torch.diag(d_inv_sqrt)
+    
+        norm_adj = torch.mm(torch.mm(d_mat_inv_sqrt, adj_mat), d_mat_inv_sqrt)
+    
+        # 희소 텐서로 변환
+        indices = torch.nonzero(norm_adj).t()
+        values = norm_adj[indices[0], indices[1]]
+    
+        return torch.sparse_coo_tensor(
+            indices, values, 
+            size=(n_users + n_items, n_users + n_items)
+        )
+    
+    def forward(self, inp):
+        item_embedding, user_behavior, hist_len, _, _, labels = self.process_input(inp)
+        batch_size = item_embedding.size(0)
+        
+        all_embeddings = torch.cat([self.embedding_dict['user_emb'], 
+                                  self.embedding_dict['item_emb']], dim=0)
+        embeddings_list = [all_embeddings]
+        
+        for layer in self.layers:
+            # Message passing without augmented features
+            side_embeddings = torch.sparse.mm(self.norm_adj_matrix, all_embeddings)
+            sum_embeddings = F.leaky_relu(layer['W1'](side_embeddings))
+            bi_embeddings = F.leaky_relu(layer['W2'](torch.mul(all_embeddings, side_embeddings)))
+            all_embeddings = sum_embeddings + bi_embeddings
+            
+            if self.training:
+                all_embeddings = F.dropout(all_embeddings, self.dropout)
+            
+            all_embeddings = F.normalize(all_embeddings, p=2, dim=1)
+            embeddings_list.append(all_embeddings)
+            
+        all_embeddings = torch.mean(torch.stack(embeddings_list), dim=0)
+        user_emb, item_emb = torch.split(all_embeddings, [self.max_hist_len, self.max_list_len])
+        
+        user_emb = user_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+        item_emb = item_emb.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        scores = torch.bmm(user_emb, item_emb.transpose(1, 2))
         scores = torch.mean(scores, dim=1)
         scores = torch.sigmoid(scores)
         

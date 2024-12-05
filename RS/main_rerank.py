@@ -17,7 +17,7 @@ import torch.utils.data as Data
 from sklearn.metrics import roc_auc_score, log_loss
 
 from utils import load_parse_from_json, setup_seed, load_data, weight_init, str2list
-from models import DLCM, PRM, SetRank, MIR, LightGCN, EnhancedLightGCN, LLM4Rerank, LightGCNPlusPlus
+from models import DLCM, PRM, SetRank, MIR, LightGCN, EnhancedLightGCN, LLM4Rerank, LightGCNPlusPlus, EnhancedLLM4Rerank, LLM4Rerank_1, NGCF, BasicDLCM, BasicLLM4Rerank, BasicLightGCN, BasicNGCF
 from utils import evaluate_rerank
 from dataset import AmzDataset
 from optimization import AdamW, get_cosine_schedule_with_warmup, get_constant_schedule_with_warmup
@@ -72,6 +72,20 @@ def load_model(args, dataset):
         model = LLM4Rerank(args, dataset).to(device)
     elif algo == 'LightGCNPlusPlus':
         model = LightGCNPlusPlus(args, dataset).to(device)
+    elif algo == 'EnhancedLLM4Rerank':
+        model = EnhancedLLM4Rerank(args, dataset).to(device)
+    elif algo == 'LLM4Rerank_1':
+        model = LLM4Rerank_1(args, dataset).to(device)
+    elif algo == 'NGCF':
+        model = NGCF(args, dataset).to(device)
+    elif algo == 'BasicDLCM':
+        model = BasicDLCM(args, dataset).to(device)
+    elif algo == 'BasicLLM4Rerank':
+        model = BasicLLM4Rerank(args, dataset).to(device)
+    elif algo == 'BasicLightGCN':
+        model = BasicLightGCN(args, dataset).to(device)
+    elif algo == 'BasicNGCF':
+        model = BasicNGCF(args, dataset).to(device)
     else:
         print('No Such Model')
         exit()
